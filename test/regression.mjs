@@ -122,13 +122,31 @@ await test('1b. 415 明确拒绝 → 降级明文并把接口标记 unsupported'
       else res.writeHead(200).end('ok')
     },
     async (base) => {
-      const res = await globalThis.fetch(`${base}/s415`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: jsonOf(60),
+      const sends = []
+      const nativeFetch = globalThis.fetch
+      // 探针铺在插件**之下**（作为插件的 origFetch），才能看到插件真正发出去的编码
+      const ctx = await fresh(undefined, async (input, init) => {
+        const h = new Headers((init && init.headers) || null)
+        sends.push(h.get('content-encoding') || 'plain')
+        return nativeFetch(input, init)
       })
-      assert.equal(res.status, 200, '415 后应明文重发并拿到 200')
-      return { status: res.status }
+      try {
+        const res = await ctx.wrapper(`${base}/s415`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: jsonOf(60),
+        })
+        assert.equal(res.status, 200, '415 后应明文重发并拿到 200')
+        assert.deepEqual(sends, ['gzip', 'plain'], '415 必须先 gzip 再降级明文，顺序不能变')
+        assert.equal(ctx.handle.unsupported.size, 1, '明文成功后应把该接口标为 unsupported')
+        assert.equal(ctx.handle.stats.replay, 1)
+        assert.equal(ctx.handle.stats.degraded, 1)
+        const key = [...ctx.handle.unsupported.keys()][0]
+        assert.ok(key.endsWith('/s415'), `unsupported key 应是该接口，实际 ${key}`)
+        return { sends, status: res.status, unsupported: key, replay: ctx.handle.stats.replay }
+      } finally {
+        ctx.restore()
+      }
     },
   )
 })
@@ -195,34 +213,54 @@ await test('2a. 流式 body 取消后立刻结束，不拖住调用方', async (
   return withServer(
     (req, res) => res.writeHead(200).end('ok'),
     async (base) => {
-      const abort = new AbortController()
-      let controller
-      const stream = new ReadableStream({
-        start(c) {
-          controller = c
-          c.enqueue(new TextEncoder().encode(jsonOf(200)))
-          // 故意不 close：模拟长流
-        },
-      })
-      const req = new Request(`${base}/stream`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: stream,
-        duplex: 'half',
-        signal: abort.signal,
-      })
-      const pending = globalThis.fetch(req).then(
-        () => 'resolved',
-        (e) => e.name,
-      )
-      await new Promise((r) => setTimeout(r, 30))
-      abort.abort()
-      const state = await Promise.race([pending, new Promise((r) => setTimeout(() => r('pending'), 300))])
+      const ctx = await fresh()
       try {
-        controller.close()
-      } catch {}
-      assert.equal(state, 'AbortError', '取消后应立刻以 AbortError 结束，而不是一直 pending')
-      return { state }
+        let nativeCalls = 0
+        const origNative = ctx.native
+        ctx.handle // 插件已装
+        // 统计插件到底有没有把请求交给原生 fetch（= 预读阶段结束）
+        const realFetch = globalThis.fetch
+        globalThis.fetch = async (input, init) => {
+          nativeCalls++
+          return realFetch(input, init)
+        }
+        // 上面这层在插件之上，测不到；改从 handle.stats 侧观察预读发生
+        globalThis.fetch = realFetch
+
+        const abort = new AbortController()
+        let controller
+        const stream = new ReadableStream({
+          start(c) {
+            controller = c
+            c.enqueue(new TextEncoder().encode(jsonOf(200)))
+            // 故意不 close：模拟长流
+          },
+        })
+        const req = new Request(`${base}/stream`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: stream,
+          duplex: 'half',
+          signal: abort.signal,
+        })
+        const pending = ctx.wrapper(req).then(
+          () => 'resolved',
+          (e) => e.name,
+        )
+        await new Promise((r) => setTimeout(r, 30))
+        // 取消前必须已经进入预读：流已被读走一块，且请求还没交给原生 fetch
+        assert.equal(ctx.handle.stats.attempted, 0, '取消前不应已经发出压缩请求')
+        abort.abort()
+        const state = await Promise.race([pending, new Promise((r) => setTimeout(() => r('pending'), 300))])
+        try {
+          controller.close()
+        } catch {}
+        assert.equal(state, 'AbortError', '取消后应立刻以 AbortError 结束，而不是一直 pending')
+        assert.ok(ctx.handle.stats.skipped >= 1, '取消应记入 skipped')
+        return { state, skipped: ctx.handle.stats.skipped, native: typeof origNative }
+      } finally {
+        ctx.restore()
+      }
     },
   )
 })
@@ -254,23 +292,41 @@ await test('2b. Request body 超过 maxPreviewBytes 时原样透传（不压缩�
 
 await test('2c. init.body 是 ReadableStream 时不预读、不压缩', async () => {
   return withServer(
-    (req, res, info) => res.writeHead(200).end(JSON.stringify({ ce: info.headers['content-encoding'] || null })),
+    (req, res, info) =>
+      res.writeHead(200).end(JSON.stringify({ ce: info.headers['content-encoding'] || null, len: info.body.length })),
     async (base) => {
-      const stream = new ReadableStream({
-        start(c) {
-          c.enqueue(new TextEncoder().encode(jsonOf(200)))
-          c.close()
-        },
-      })
-      const res = await globalThis.fetch(`${base}/s`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: stream,
-        duplex: 'half',
-      })
-      const body = await res.json()
-      assert.equal(body.ce, null, '流式 init.body 必须保留原生传输语义')
-      return { ce: body.ce }
+      const ctx = await fresh()
+      try {
+        let consumed = 0
+        const payload = jsonOf(200)
+        const stream = new ReadableStream({
+          pull(c) {
+            if (consumed === 0) {
+              consumed += payload.length
+              c.enqueue(new TextEncoder().encode(payload))
+            } else {
+              c.close()
+            }
+          },
+        })
+        const res = await ctx.wrapper(`${base}/s`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: stream,
+          duplex: 'half',
+        })
+        const info = await res.json()
+        assert.equal(info.ce, null, '流式 init.body 必须保留原生传输语义')
+        assert.equal(info.len, payload.length, '请求体应完整送达')
+        // 经过插件：被记为 skipped（body:ReadableStream），且没有压缩尝试
+        assert.ok(ctx.handle.stats.skipped >= 1, '应经过插件并记为 skipped')
+        assert.equal(ctx.handle.stats.attempted, 0, '不得进入压缩')
+        const reasons = Object.keys(JSON.parse(readFileSync(ctx.handle.stateFile || '', 'utf8') || '{}')).length
+        void reasons
+        return { ce: info.ce, len: info.len, skipped: ctx.handle.stats.skipped, attempted: ctx.handle.stats.attempted }
+      } finally {
+        ctx.restore()
+      }
     },
   )
 })
@@ -605,7 +661,7 @@ await test('9. 统计字段完整且合法 JSON', async () => {
       assert.equal(typeof raw.lifetime[k], 'number', `lifetime.${k} 必须存在`)
     }
     assert.equal(raw.version, 2)
-    assert.equal(raw.plugin, '1.0.6')
+    assert.equal(raw.plugin, '1.0.7')
     assert.ok(raw.lifetime.compressed >= 1)
     assert.ok(raw.lifetime.bytesOut < raw.lifetime.bytesIn, '压缩后字节应少于原始字节')
     return { lifetime: raw.lifetime }
@@ -632,6 +688,377 @@ await test('9b. 压缩自身出错时原样透传（不让请求失败）', asyn
   } finally {
     ctx.restore()
   }
+})
+
+// ------------------------------------------------------------------ 10. headers 整组替换（P1）
+
+await test('10a. init.headers 整组替换：不得携带原 Request 的 Authorization/x-old', async () => {
+  return withServer(
+    (req, res, info) => {
+      res.writeHead(200).end(JSON.stringify({
+        auth: info.headers['authorization'] || null,
+        xOld: info.headers['x-old'] || null,
+        xNew: info.headers['x-new'] || null,
+        ce: info.headers['content-encoding'] || null,
+      }))
+    },
+    async (base) => {
+      const ctx = await fresh()
+      try {
+        const req = new Request(`${base}/replace`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: 'Bearer dummy-audit-only', 'x-old': 'remove-me' },
+          body: jsonOf(60),
+        })
+        const res = await ctx.wrapper(req, {
+          headers: { 'content-type': 'application/json', 'x-new': 'new' },
+        })
+        const info = await res.json()
+        assert.equal(info.auth, null, '调用方明确去掉的 Authorization 绝不能继续发出')
+        assert.equal(info.xOld, null, 'x-old 应被整组替换掉')
+        assert.equal(info.xNew, 'new', 'init.headers 的新头必须生效')
+        assert.equal(info.ce, 'gzip', '替换头之后仍应正常压缩')
+        return info
+      } finally {
+        ctx.restore()
+      }
+    },
+  )
+})
+
+await test('10b. init.headers 为空对象 → 清空原 Request 的整组头', async () => {
+  return withServer(
+    (req, res, info) =>
+      res.writeHead(200).end(JSON.stringify({ auth: info.headers['authorization'] || null, ct: info.headers['content-type'] || null })),
+    async (base) => {
+      const ctx = await fresh()
+      try {
+        const req = new Request(`${base}/empty`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: 'Bearer dummy-audit-only' },
+          body: jsonOf(60),
+        })
+        const res = await ctx.wrapper(req, { headers: {} })
+        const info = await res.json()
+        assert.equal(info.auth, null, '空 headers 应清空 Authorization')
+        assert.equal(info.ct, null, '空 headers 应清空 content-type')
+        return info
+      } finally {
+        ctx.restore()
+      }
+    },
+  )
+})
+
+await test('10c. init.headers 未给出 → 继承原 Request 的头并压缩', async () => {
+  return withServer(
+    (req, res, info) =>
+      res.writeHead(200).end(JSON.stringify({ ct: info.headers['content-type'] || null, ce: info.headers['content-encoding'] || null })),
+    async (base) => {
+      const ctx = await fresh()
+      try {
+        const req = new Request(`${base}/inherit`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: jsonOf(60),
+        })
+        const res = await ctx.wrapper(req)
+        const info = await res.json()
+        assert.equal(info.ct, 'application/json', '未给 init.headers 时应继承')
+        assert.equal(info.ce, 'gzip')
+        return info
+      } finally {
+        ctx.restore()
+      }
+    },
+  )
+})
+
+// ------------------------------------------------------------------ 11. 预读分支清理（P2）
+
+await test('11. 多块流超限 → 废弃的预读分支被取消，原请求字节完整', async () => {
+  const chunkBytes = 256 * 1024
+  const chunks = 12
+  const cap = 1024
+  return withServer(
+    (req, res, info) => res.writeHead(200).end(JSON.stringify({ ce: info.headers['content-encoding'] || null, len: info.raw.length })),
+    async (base) => {
+      let produced = 0
+      let pullAfterCanceled = 0
+      let canceled = false
+      const stream = new ReadableStream({
+        pull(c) {
+          if (produced < chunks) {
+            produced++
+            c.enqueue(new Uint8Array(chunkBytes).fill(65))
+          } else {
+            c.close()
+          }
+        },
+        cancel() {
+          canceled = true
+        },
+      })
+      const ctx = await fresh({ maxPreviewBytes: cap })
+      try {
+        const req = new Request(`${base}/multi`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: stream,
+          duplex: 'half',
+        })
+        const res = await ctx.wrapper(req)
+        const info = await res.json()
+        // 超过上限 ⇒ 不压缩，原样透传
+        assert.equal(info.ce, null, '超过预读上限应原样透传')
+        assert.equal(info.len, chunkBytes * chunks, '原请求字节必须完整送达')
+        // 预读分支进入过并触发了取消（不是读完走正常路径）
+        assert.ok(ctx.handle.stats.skipped >= 1, '应记为 skipped')
+        void pullAfterCanceled
+        return { bytes: info.len, ce: info.ce, canceled, produced }
+      } finally {
+        ctx.restore()
+      }
+    },
+  )
+})
+
+await test('11b. 预读取消不产生 unhandled rejection，原分支仍可读', async () => {
+  const unhandled = []
+  const onUnhandled = (e) => unhandled.push(String(e))
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    const ctx = await fresh({ maxPreviewBytes: 512 })
+    try {
+      const payload = jsonOf(400)
+      const req = new Request('https://audit.invalid/preview-cancel', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: payload,
+      })
+      let seen = null
+      // 让插件的 origFetch 什么都不做，我们只关心预读阶段
+      const nativeFetch = globalThis.fetch
+      globalThis.fetch = async (input, init) => {
+        seen = new Headers(init && init.headers)
+        // 干跑：不真正发送，但把 Request body 读掉模拟传输
+        if (input instanceof Request && input.body) await input.arrayBuffer().catch(() => {})
+        return new Response('')
+      }
+      try {
+        await ctx.wrapper(req).catch(() => {})
+      } finally {
+        globalThis.fetch = nativeFetch
+      }
+      await new Promise((r) => setTimeout(r, 60))
+      assert.deepEqual(unhandled, [], `不应有 unhandledRejection，实际 ${unhandled.join(' | ')}`)
+      assert.equal(seen && seen.get('content-encoding'), null, '超限应透传且不压缩')
+      return { unhandledCount: unhandled.length }
+    } finally {
+      ctx.restore()
+    }
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled)
+  }
+})
+
+// ------------------------------------------------------------------ 12. 并发探测取消（P2）
+
+await test('12a. 并发探测等待可取消，且释放被放弃的响应', async () => {
+  const nativeFetch = globalThis.fetch
+  const sends = []
+  const canceledIds = []
+  let releaseFirst
+  const firstGate = new Promise((r) => {
+    releaseFirst = r
+  })
+  let firstPlainStarted
+  const firstStarted = new Promise((r) => {
+    firstPlainStarted = r
+  })
+  let secondCompressedDone
+  const second415 = new Promise((r) => {
+    secondCompressedDone = r
+  })
+  let compressedCount = 0
+
+  const ctx = await fresh(undefined, async (input, init) => {
+    const ce = new Headers((init && init.headers) || null).get('content-encoding') || 'plain'
+    sends.push(ce)
+    if (ce === 'gzip') {
+      const id = ++compressedCount
+      if (id === 2) secondCompressedDone()
+      return new Response(
+        new ReadableStream({
+          cancel() {
+            canceledIds.push(id)
+          },
+        }),
+        { status: 415 },
+      )
+    }
+    // 明文：第一条挂住，第二条直接成功
+    if (sends.filter((x) => x === 'plain').length === 1) {
+      firstPlainStarted()
+      await firstGate
+    }
+    return new Response('')
+  })
+  void nativeFetch
+  try {
+    const first = ctx.wrapper('https://probe.invalid/model', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: jsonOf(60),
+    })
+    await firstStarted
+
+    const ac = new AbortController()
+    const second = ctx
+      .wrapper('https://probe.invalid/model', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: jsonOf(60),
+        signal: ac.signal,
+      })
+      .then(
+        () => 'resolved',
+        (e) => e.name,
+      )
+    await second415
+    await new Promise((r) => setTimeout(r, 20))
+    ac.abort()
+    const afterAbort = await Promise.race([second, new Promise((r) => setTimeout(() => r('still pending'), 300))])
+    releaseFirst()
+    await first.catch(() => {})
+    const final = await second
+    assert.equal(afterAbort, 'AbortError', '第二个请求取消后必须立刻结束，而不是等第一个探测')
+    assert.equal(final, 'AbortError')
+    assert.ok(canceledIds.includes(1), `被放弃的 415 响应应被 cancel，实际 ${canceledIds.join(',')}`)
+    return { afterAbort, final, canceledIds, sends }
+  } finally {
+    ctx.restore()
+  }
+})
+
+// ------------------------------------------------------------------ 13. replayBytes 落盘（P2）
+
+await test('13. replayBytes 写入 lifetime 与 day 增量', async () => {
+  return withServer(
+    (req, res, info) => {
+      res.writeHead(info.headers['content-encoding'] === 'gzip' ? 415 : 200).end('')
+    },
+    async (base) => {
+      const ctx = await fresh()
+      try {
+        const body = jsonOf(60)
+        const bytes = Buffer.byteLength(body)
+        await ctx.wrapper(`${base}/rbytes`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body,
+        })
+        assert.equal(ctx.handle.stats.replayBytes, bytes, '内存里的 replayBytes 应为请求体字节数')
+        await ctx.handle.flush()
+        const state = JSON.parse(readFileSync(ctx.handle.stateFile, 'utf8'))
+        assert.equal(state.lifetime.replayBytes, bytes, 'lifetime.replayBytes 必须落盘')
+        assert.equal(state.lifetime.replay, 1)
+        assert.equal(state.day.replayBytes, bytes, 'day.replayBytes 必须落盘')
+        assert.equal(state.day.replay, 1)
+
+        // 同一接口在 unsupported 期内会直接走明文、不再 replay —— 这是正确行为。
+        // 换一个接口才能验证累加语义。
+        await ctx.wrapper(`${base}/rbytes-2`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body,
+        })
+        await ctx.handle.flush()
+        const again = JSON.parse(readFileSync(ctx.handle.stateFile, 'utf8'))
+        assert.equal(again.lifetime.replayBytes, bytes * 2, '第二个接口的重发字节应累加')
+        assert.equal(again.lifetime.replay, 2)
+
+        // 同一接口再发：直接明文，不得再记 replay
+        await ctx.wrapper(`${base}/rbytes`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body,
+        })
+        assert.equal(ctx.handle.stats.replay, 2, 'unsupported 期内同接口不应再 replay')
+        return { bytes, inMemory: ctx.handle.stats.replayBytes, persisted: again.lifetime.replayBytes }
+      } finally {
+        ctx.restore()
+      }
+    },
+  )
+})
+
+// ------------------------------------------------------------------ 14. TTL 能区分过期与永久
+
+await test('14. TTL 过期后能力缓存必须失效（能被区分出永久缓存）', async () => {
+  return withServer(
+    (req, res, info) => res.writeHead(info.headers['content-encoding'] === 'gzip' ? 200 : 200).end('ok'),
+    async (base) => {
+      const ctx = await fresh({ verifiedTtlMs: 40 })
+      try {
+        await ctx.wrapper(`${base}/ttl`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: jsonOf(60),
+        })
+        assert.equal(ctx.handle.verified.size, 1, '首次成功应记入 verified')
+        assert.equal(ctx.handle.capabilities().length, 1)
+        await new Promise((r) => setTimeout(r, 80))
+        // 过期后：capabilities 不再列出
+        assert.equal(ctx.handle.capabilities().length, 0, '过期后不应再出现在能力列表')
+        // 关键：再次请求应重新走压缩探测（若缓存永久，会直接命中 verified 而不重发）
+        const before = ctx.handle.stats.attempted
+        await ctx.wrapper(`${base}/ttl`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: jsonOf(60),
+        })
+        assert.equal(ctx.handle.stats.attempted, before + 1, '过期后必须重新尝试压缩')
+        assert.equal(ctx.handle.verified.size, 1, '重新成功后应再次 in verified')
+        return { attemptedBefore: before, attemptedAfter: ctx.handle.stats.attempted }
+      } finally {
+        ctx.restore()
+      }
+    },
+  )
+})
+
+// ------------------------------------------------------------------ 15. integrity 负例
+
+await test('15. integrity 摘要错误必须被拒绝（负例）', async () => {
+  const respBody = 'real-body'
+  return withServer(
+    (req, res) => res.writeHead(200, { 'content-length': String(Buffer.byteLength(respBody)) }).end(respBody),
+    async (base) => {
+      const ctx = await fresh()
+      try {
+        const wrong = createHash('sha256').update(Buffer.from('not-the-body')).digest('base64')
+        const req = new Request(`${base}/bad-integrity`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: jsonOf(60),
+          integrity: `sha256-${wrong}`,
+        })
+        let rejected = false
+        let name = ''
+        try {
+          await ctx.wrapper(req)
+        } catch (e) {
+          rejected = true
+          name = e.name
+        }
+        assert.equal(rejected, true, '错误摘要必须被拒绝，不能被插件吞掉')
+        return { rejected, name }
+      } finally {
+        ctx.restore()
+      }
+    },
+  )
 })
 
 // ------------------------------------------------------------------ 汇总

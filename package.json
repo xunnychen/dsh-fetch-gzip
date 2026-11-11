@@ -1,6 +1,6 @@
 {
   "name": "@dsh-external/dsh-fetch-gzip",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "自动 gzip 压缩出向 JSON 请求体（零配置、全 harness 通用、失败自动降级）",
   "private": true,
   "type": "module",

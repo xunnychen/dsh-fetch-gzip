@@ -2,7 +2,10 @@
 
 自动把出向 JSON 请求体压成 gzip，patch 进程级 `globalThis.fetch`。零配置可用，全部行为可配。
 
-当前版本：**1.0.6**（对应 2026-11-11 审查报告 `review.md` 的第 1–8 项修复）。
+当前版本：**1.0.7**。
+
+- 1.0.6 对应 2026-11-11 审查报告 `review.md` 的第 1–8 项修复。
+- 1.0.7 对应同批复核 `recheck-1.0.6.md` 的 5 项剩余问题：init.headers 整组替换、预读分支取消、并发探测等待可取消、replayBytes 落盘、能力缓存内存上限。
 
 ## 装在哪
 
@@ -41,7 +44,7 @@ done
 | `saveIntervalMs` | `5000` | 统计落盘节流 |
 | `lockStaleMs` | `10000` | 锁文件死锁判定 |
 | `maxDiagKeys` | `200` | 诊断键上限 |
-| `maxEndpoints` | `200` | 持久化能力条目上限 |
+| `maxEndpoints` | `200` | 能力缓存上限（内存 Map 与持久化输出同时受限） |
 
 ### 重发策略
 
@@ -68,7 +71,7 @@ handle API：`flush()` 返回 Promise（异步非阻塞）；`flushSync()` 只�
 ## 测试
 
 ```bash
-node test/regression.mjs   # 19 项行为回归，全部走本地 http server 真实收发
+node test/regression.mjs   # 28 项行为回归，全部走本地 http server 真实收发
 ```
 
 ## 已知取舍
