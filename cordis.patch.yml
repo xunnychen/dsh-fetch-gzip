@@ -1,0 +1,9 @@
+# @dsh-external/dsh-fetch-gzip bundle layer.
+# Harness >= 0.2.0 requires every entry in dsh.profile.bundles to declare
+# dsh.bundle.patch in its package.json. Without it the whole package is
+# skipped at boot ("declares no dsh.bundle") and nothing is compressed.
+# This layer inserts the plugin itself into the profile's plugin tree.
+- insert:
+    - id: dsh-fetch-gzip
+      name: '@dsh-external/dsh-fetch-gzip'
+      config: {}

@@ -1,0 +1,23 @@
+{
+  "name": "@dsh-external/dsh-fetch-gzip",
+  "version": "1.0.6",
+  "description": "自动 gzip 压缩出向 JSON 请求体（零配置、全 harness 通用、失败自动降级）",
+  "private": true,
+  "type": "module",
+  "main": "./lib/index.js",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "test"
+  ],
+  "license": "BSD-3-Clause",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "cordis": ">=4.0.0-rc <5"
+  }
+}
