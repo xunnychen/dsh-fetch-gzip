@@ -19,5 +19,21 @@
   },
   "peerDependencies": {
     "cordis": ">=4.0.0-rc <5"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xunnychen/dsh-fetch-gzip.git"
+  },
+  "homepage": "https://github.com/xunnychen/dsh-fetch-gzip#readme",
+  "bugs": {
+    "url": "https://github.com/xunnychen/dsh-fetch-gzip/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "gzip",
+    "fetch",
+    "undici",
+    "compression"
+  ]
 }
